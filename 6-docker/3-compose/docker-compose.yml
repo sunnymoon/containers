@@ -1,0 +1,23 @@
+services:
+  web:
+    image: nginx:alpine
+    container_name: demo-web
+    ports:
+      - "8081:80"
+    volumes:
+      - ./web-content:/usr/share/nginx/html:ro
+    networks:
+      - demo-net
+
+  api:
+    image: hashicorp/http-echo:1.0.0
+    container_name: demo-api
+    command: [ "-text=compose api says hello" ]
+    expose:
+      - "5678"
+    networks:
+      - demo-net
+
+networks:
+  demo-net:
+    name: demo-compose-net

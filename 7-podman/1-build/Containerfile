@@ -1,0 +1,12 @@
+# Step 7.1 - Podman build demo image
+FROM quay.io/fedora/fedora:41
+
+RUN dnf -y install bash iproute iputils procps-ng && dnf clean all
+
+WORKDIR /app
+COPY app.sh /app/app.sh
+RUN chmod +x /app/app.sh
+
+ENV DEMO_NAME="podman-build-demo"
+
+ENTRYPOINT ["/app/app.sh"]
