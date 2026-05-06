@@ -30,7 +30,7 @@ style: |
 
 ```
 $ unshare --mount --pid --uts --net --fork \
-    --mount-proc /bin/bash
+  --mount-proc /bin/bash --noprofile --norc
 ```
 
 > _"Containers are just Linux processes with extra steps"_
@@ -51,7 +51,7 @@ $ unshare --mount --pid --uts --net --fork \
 
 ---
 
-## Prereqs and Permission Paths (Fail First, Rootless, Then sudo)
+## Prereqs and Permission Paths (Fail First, Then Rootless)
 
 ### Copy/paste hygiene (bash)
 
@@ -65,7 +65,7 @@ bind 'set enable-bracketed-paste on'
 ### 1) Intentionally fail as normal user
 
 ```bash
-unshare --mount --pid --uts --net --fork --mount-proc /bin/bash
+unshare --mount --pid --uts --net --fork --mount-proc /bin/bash --noprofile --norc
 # expected: Operation not permitted / forbidden
 ```
 
@@ -208,7 +208,7 @@ chroot rootfs
 
 ```text
 Phase 2 (real container-style root switch)
-unshare --mount
+unshare --user --map-root-user --mount --pid --fork
    -> pivot_root
    -> old root unmounted
 ```
@@ -229,6 +229,14 @@ unshare --mount
 ## Step 1 — The Old Way: `chroot`
 
 `chroot` has been in Unix since **1979** (Version 7 AT&T Unix)
+
+For smoother live demos, prepare a less minimal rootfs first:
+
+```bash
+cd 1-fs
+./setup.sh
+# setup.sh now tries to install: bash coreutils util-linux procps iproute2 iputils
+```
 
 ```bash
 # download a minimal Alpine Linux root filesystem
@@ -271,7 +279,7 @@ chroot process
 
 ```bash
 # create a new mount namespace first
-unshare --mount bash
+unshare --user --map-root-user --mount --pid --fork bash --noprofile --norc
 
 # bind-mount rootfs on itself (pivot_root requires a mount point)
 mount --bind rootfs/ rootfs/
@@ -282,13 +290,87 @@ mkdir -p rootfs/.oldroot
 # switch the root
 cd rootfs/
 pivot_root . .oldroot
+cd /
 
 # tidy up
-mount -t proc proc /proc
-umount -l /.oldroot
+# after pivot_root, clear bash command hash (old /usr/bin paths may be stale)
+hash -r
+
+# mount /proc and detach old root (best effort in tiny rootfs)
+if command -v mount >/dev/null 2>&1; then
+  mount -t proc proc /proc || true
+elif [ -x /bin/busybox ]; then
+  /bin/busybox mount -t proc proc /proc 2>/dev/null || true
+fi
+
+if command -v umount >/dev/null 2>&1; then
+  umount -l /.oldroot || true
+elif [ -x /bin/busybox ]; then
+  /bin/busybox umount -l /.oldroot 2>/dev/null || true
+fi
+
+# proof without relying on ls/cat binaries
+echo "PWD after pivot_root: $PWD"
+echo "Root entries (shell glob):" /*
+if [ -r /etc/os-release ]; then
+  IFS= read -r first_line < /etc/os-release
+  echo "os-release first line: $first_line"
+fi
+if [ -e /.oldroot ]; then
+  echo "old root path still visible (cleanup skipped or failed)"
+else
+  echo "old root detached"
+fi
 ```
 
-Now `ls /` shows **only** the Alpine rootfs — not just a chdir trick.
+Now you can prove the root switch even in minimal environments: shell globbing shows `/` and `os-release` comes from Alpine, even if cleanup tools are unavailable.
+
+### Optional Advanced Demo — loopback-backed rootfs
+
+If you want `/proc/mounts` to show a different backing device for `/` (closer to real container storage behavior), use a loopback image instead of a host directory bind mount.
+
+```bash
+# from 1-fs/
+dd if=/dev/zero of=alpine-rootfs.img bs=1M count=512
+mkfs.ext4 -F alpine-rootfs.img
+
+mkdir -p loopmnt
+sudo mount -o loop alpine-rootfs.img loopmnt
+
+# copy prepared rootfs into loop image
+sudo cp -a rootfs/. loopmnt/
+sudo mkdir -p loopmnt/.oldroot
+
+# now run rootless namespace/pivot steps
+unshare --user --map-root-user --mount --pid --fork bash --noprofile --norc
+
+# make mount propagation private in this namespace (avoids pivot_root EINVAL)
+mount --make-rprivate /
+
+# ensure new root is a mount point in this namespace
+mount --bind loopmnt loopmnt
+
+cd loopmnt
+pivot_root . .oldroot
+cd /
+hash -r
+if ! mount -t proc proc /proc; then
+  /bin/busybox mount -t proc proc /proc || true
+fi
+if ! umount -l /.oldroot; then
+  /bin/busybox umount -l /.oldroot || true
+fi
+
+# now check backing mount source for /
+/bin/busybox cat /proc/mounts
+
+# after exiting that shell, cleanup on host
+sudo umount loopmnt
+```
+
+Expected:
+- root mount source is a loop device (for example `/dev/loop0`) instead of your host disk directly
+- this better illustrates that container rootfs is typically its own mounted filesystem view (Docker often uses overlayfs)
 
 ---
 
@@ -334,21 +416,34 @@ flowchart LR
 Control Groups = **kernel accounting + enforcement** per process group
 
 ```bash
+# run one line at a time (safer for live demos)
+# no interactive root shell required
+
 # check if cgroups v2 is active
 mount | grep cgroup2
 # cgroup2 on /sys/fs/cgroup type cgroup2 ...
 
 # create a new cgroup slice
-mkdir /sys/fs/cgroup/demo
+sudo mkdir -p /sys/fs/cgroup/demo
 
-# set a 64 MiB memory limit
-echo $((64 * 1024 * 1024)) > /sys/fs/cgroup/demo/memory.max
+# enable memory controller for child cgroups (ignore if already enabled)
+echo +memory | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
 
-# enable OOM killer (don't just throttle)
-echo 1 > /sys/fs/cgroup/demo/memory.oom.group
+# set a 32 MiB memory limit
+echo $((32 * 1024 * 1024)) | sudo tee /sys/fs/cgroup/demo/memory.max >/dev/null
+
+# disable swap fallback so memory pressure triggers OOM quickly
+echo 0 | sudo tee /sys/fs/cgroup/demo/memory.swap.max >/dev/null
+
+# kill only offending task (not whole cgroup)
+echo 0 | sudo tee /sys/fs/cgroup/demo/memory.oom.group >/dev/null
 
 # attach current shell to the cgroup
-echo $$ > /sys/fs/cgroup/demo/cgroup.procs
+echo $$ | sudo tee /sys/fs/cgroup/demo/cgroup.procs >/dev/null
+
+# verify limit values
+sudo cat /sys/fs/cgroup/demo/memory.max
+sudo cat /sys/fs/cgroup/demo/memory.swap.max
 ```
 
 ---
@@ -356,17 +451,20 @@ echo $$ > /sys/fs/cgroup/demo/cgroup.procs
 ## Step 2 — Watching the OOM Killer
 
 ```bash
-# inside cgroup-constrained shell:
+# no interactive root shell required
 
-# check current memory usage
-cat /sys/fs/cgroup/demo/memory.current
+# move this shell out first so demo shell survives
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs >/dev/null
 
-# try to allocate more than 64 MiB with Python
-python3 -c "x = bytearray(100 * 1024 * 1024)"
-# Killed  ← OOM killer strikes!
+# run allocator in background and move only it into limited cgroup
+python3 -c 'x = bytearray(50 * 1024 * 1024); print("allocated!")' &
+ALLOC_PID=$!
+echo $ALLOC_PID | sudo tee /sys/fs/cgroup/demo/cgroup.procs >/dev/null
+wait $ALLOC_PID
+# expected: process killed (often exit 137)
 
 # host kernel log shows the kill
-dmesg | tail -5
+sudo dmesg 2>/dev/null | grep -i 'oom\|killed' | tail -5
 # [  123.456] Memory cgroup out of memory: Kill process ...
 ```
 
@@ -377,15 +475,38 @@ dmesg | tail -5
 ## Step 2 — Other cgroup Controllers
 
 ```bash
-# CPU: limit to 50% of one core (period = 100ms, quota = 50ms)
-echo "50000 100000" > /sys/fs/cgroup/demo/cpu.max
+# no interactive root shell required
 
-# PIDs: max 10 processes
-echo 10 > /sys/fs/cgroup/demo/pids.max
+# CPU: limit to 50% of one core (period = 100ms, quota = 50ms)
+echo "50000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max >/dev/null
+
+# PIDs: max 2 processes in demo cgroup
+echo 2 | sudo tee /sys/fs/cgroup/demo/pids.max >/dev/null
+
+# keep your interactive shell OUTSIDE the limited cgroup
+echo $$ | sudo tee /sys/fs/cgroup/cgroup.procs >/dev/null
+
+# run a short-lived child shell inside demo cgroup:
+# first fork succeeds, second fork fails due to pids.max
+sudo bash -c '
+  echo $$ > /sys/fs/cgroup/demo/cgroup.procs
+  sleep 300 &
+  echo "first background process: OK"
+  sleep 300 &
+  echo "you should not reliably see this line"
+'
+
+# cleanup demo sleeps from host shell
+sudo pkill -f "sleep 300" 2>/dev/null || true
 
 # check all active controllers
-cat /sys/fs/cgroup/demo/cgroup.controllers
+sudo cat /sys/fs/cgroup/demo/cgroup.controllers
 # cpuset cpu io memory hugetlb pids rdma
+
+# recovery if you ever trap a shell in a full pids cgroup:
+# from another terminal as root:
+#   echo max > /sys/fs/cgroup/demo/pids.max
+#   pkill -f "sleep 300" 2>/dev/null || true
 ```
 
 **cgroups answer:** _"How much?"_  
@@ -421,17 +542,18 @@ Host PID space            Container PID space
 ## Step 3 — `unshare --pid`
 
 ```bash
-# new PID namespace + new mount namespace for /proc
-unshare --pid --fork --mount-proc bash
+# Terminal A: create a new PID namespace with a unique process name
+unshare --user --map-root-user --pid --mount --fork --mount-proc \
+  bash -c 'exec -a step3-pidns bash --noprofile --norc'
 
 # inside — check our PID
 echo $$          # 1 !
 
 # check what processes we see
-ps aux
+ps -ef
 # PID  CMD
 #   1  bash
-#   6  ps aux
+#   6  ps -ef
 
 # we ARE PID 1. Nothing else visible.
 ```
@@ -439,10 +561,11 @@ ps aux
 From **another terminal** on the host:
 
 ```bash
-# the process exists on the host with its real PID
-ps aux | grep bash    # PID 3848
-# Enter the namespace from outside:
-nsenter --pid --target 3848 -- ps aux
+# find the real host PID of that namespace shell
+HOSTPID=$(pgrep -f -n step3-pidns)
+
+# Enter the namespace from outside (usually needs root)
+sudo nsenter --pid --target "$HOSTPID" -- ps -ef
 ```
 
 ---
@@ -452,16 +575,16 @@ nsenter --pid --target 3848 -- ps aux
 `nsenter` lets you **join an existing namespace** — the operator's swiss army knife.
 
 ```bash
-# find the "container" PID on the host
-CPID=$(pidof unshare)
+# find the namespace shell PID on the host
+CPID=$(pgrep -f -n step3-pidns)
 
 # enter ONLY the PID namespace, keeping your own terminal
-nsenter --pid=/proc/$CPID/ns/pid --target $CPID -- ps aux
+sudo nsenter --target "$CPID" --pid -- ps -ef
 
 # enter ALL namespaces (like docker exec)
-nsenter --target $CPID \
+sudo nsenter --target "$CPID" \
         --mount --pid --uts --net \
-        -- /bin/sh
+  -- bash --noprofile --norc
 ```
 
 > This is literally what `docker exec` does under the hood.
@@ -494,7 +617,7 @@ Host:                     Container:
 
 ```bash
 # create a UTS namespace
-unshare --uts bash
+unshare --uts bash --noprofile --norc
 
 # check hostname (same as host right now)
 hostname          # laptop-01
@@ -511,7 +634,7 @@ hostname          # laptop-01 ← unchanged!
 Now combine it with what we built before:
 
 ```bash
-unshare --mount --pid --uts --fork --mount-proc bash
+unshare --mount --pid --uts --fork --mount-proc bash --noprofile --norc
 hostname my-alpine
 # + pivot_root into Alpine rootfs
 ```
@@ -529,7 +652,7 @@ unshare \
   --uts          # ← Step 4: own hostname
   --fork         # fork so child gets the new PID ns
   --mount-proc   # remount /proc for the new PID ns
-  /bin/bash
+  /bin/bash --noprofile --norc
 ```
 
 We now have a process that:
@@ -610,7 +733,7 @@ ping -c 3 172.20.0.2
 ip netns exec mycontainer ping -c 3 172.20.0.1
 
 # enter the namespace interactively
-ip netns exec mycontainer bash
+ip netns exec mycontainer bash --noprofile --norc
 
 # inside: own network stack
 ip addr show      # only lo and veth1
@@ -649,9 +772,9 @@ ip netns exec mycontainer ping -c 2 8.8.8.8
 
 ip netns add mycontainer
 
-unshare --mount --pid --uts --net --fork bash <<'EOF'
+unshare --mount --pid --uts --net --fork bash --noprofile --norc <<'EOF'
   # move into network namespace  
-  ip netns exec mycontainer bash
+  ip netns exec mycontainer bash --noprofile --norc
   
   # set hostname
   hostname my-alpine
@@ -879,7 +1002,7 @@ Demo points:
 │  Step 5: Net ns  → veth1 / 172.20.0.2       │
 │  Step 1: Mnt ns  → pivot_root → Alpine /    │
 ├─────────────────────────────────────────────┤
-│  Step 2: cgroup  → max 64 MiB RAM, 50% CPU  │
+│  Step 2: cgroup  → max 32 MiB RAM, 50% CPU  │
 ├─────────────────────────────────────────────┤
 │              Linux Kernel                    │
 └─────────────────────────────────────────────┘

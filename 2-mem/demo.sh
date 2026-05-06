@@ -125,8 +125,13 @@ run_cmd "echo $((32 * 1024 * 1024)) > ${CGROUP_PATH}/memory.max"
 run_cmd "cat ${CGROUP_PATH}/memory.max"
 echo
 
-step "Enable the OOM killer (kill the process, not just throttle):"
-run_cmd "echo 1 > ${CGROUP_PATH}/memory.oom.group"
+step "Disable swap for this cgroup (no swap fallback, forces OOM killer):"
+run_cmd "echo 0 > ${CGROUP_PATH}/memory.swap.max"
+run_cmd "cat ${CGROUP_PATH}/memory.swap.max"
+echo
+
+step "Configure OOM killer to target only the offending process (not the whole cgroup):"
+run_cmd "echo 0 > ${CGROUP_PATH}/memory.oom.group"
 echo
 
 step "Assign current shell to the cgroup:"
@@ -143,22 +148,32 @@ pause
 banner "3/4 — Trigger the OOM killer"
 
 step "We'll try to allocate 50 MiB inside our 32 MiB cgroup."
-info "The kernel OOM killer will terminate the process."
+info "Since we disabled swap.max, it has no fallback — OOM killer will strike."
 echo
 
 warn "Watch what happens..."
 echo
 
-# Run the allocator as a child so it gets OOM-killed but our shell survives
-run_cmd "bash -c \"python3 -c 'x = bytearray(50 * 1024 * 1024); print(\\\"allocated!\\\")' && echo OK\""
+# Move the demo shell OUT of the cgroup so only the child process gets OOM-killed
+echo $$ > "${CGROUP_ROOT}/cgroup.procs"
+
+# Spawn the allocator in background (initially in root cgroup)
+python3 -c 'x = bytearray(50 * 1024 * 1024); print("allocated!")' &
+ALLOC_PID=$!
+
+# Move the background process to the limited cgroup
+echo $ALLOC_PID > "${CGROUP_PATH}/cgroup.procs"
+
+# Wait for it to complete (or get OOM-killed)
+run_cmd "wait $ALLOC_PID"
 EXIT_CODE=$?
 
 echo
 if [[ $EXIT_CODE -ne 0 ]]; then
-    ok "The child process was killed (exit code: ${EXIT_CODE})"
+    ok "The child process was killed by OOM (exit code: ${EXIT_CODE})"
     ok "Our shell survived — only the offending process was terminated."
 else
-    info "Process completed (cgroup memory might allow burstable usage on this kernel)."
+    warn "Process completed without OOM kill — swap may still be enabled globally."
 fi
 
 echo
@@ -182,17 +197,35 @@ run_cmd "echo '50000 100000' > ${CGROUP_PATH}/cpu.max" 2>/dev/null || \
 run_cmd "cat ${CGROUP_PATH}/cpu.max 2>/dev/null || echo '(N/A)'"
 echo
 
-step "PID limit: max 20 processes in this cgroup:"
-run_cmd "echo 20 > ${CGROUP_PATH}/pids.max" 2>/dev/null || \
+step "PID limit: max 2 processes in this cgroup:"
+run_cmd "echo 2 > ${CGROUP_PATH}/pids.max" 2>/dev/null || \
     info "(pids controller not enabled — skipping)"
 run_cmd "cat ${CGROUP_PATH}/pids.max 2>/dev/null || echo '(N/A)'"
 echo
 
-step "Try to exceed the PID limit:"
-run_cmd "for i in \$(seq 1 25); do sleep 60 & done; echo spawned; jobs | wc -l" || true
-# cleanup background sleep jobs
-kill %% 2>/dev/null || true
-disown -a 2>/dev/null || true
+step "Assign the demo script to the cgroup (will take up 1 PID slot):"
+run_cmd "echo \$\$ > ${CGROUP_PATH}/cgroup.procs"
+info "The script is now in the cgroup (1 out of 2 PIDs used)."
+echo
+
+step "Try to spawn the 1st background sleep (should succeed, fills the cgroup):"
+echo -e "${DIM}  \$${RST} ${MAG}sleep 300 &${RST}"
+sleep 300 &
+SLEEP1=$!
+echo -e "${GRN}  [PID $SLEEP1 spawned]${RST}"
+echo
+
+step "Now the cgroup is FULL (script + 1 sleep = 2/2 limit)."
+step "Try to spawn a 2nd sleep (should FAIL with 'Resource temporarily unavailable'):"
+echo -e "${DIM}  \$${RST} ${MAG}sleep 300 &${RST}"
+sleep 300 & 2>&1 || true
+echo
+info "✓ The fork was blocked by the PID limit!"
+echo
+
+# cleanup
+info "Cleaning up background jobs..."
+run_cmd "kill $SLEEP1 2>/dev/null; jobs -p | xargs -r kill -9 2>/dev/null; disown -a 2>/dev/null; true"
 
 pause
 

@@ -45,7 +45,14 @@ cmd_preview() {
 pause() {
     echo
     echo -e "${YLW}  ══════════ Press ENTER to continue ══════════${RST}"
-    read -r
+
+    # Always read from the controlling TTY so nested shells/unshare do not steal stdin.
+    if [[ -e /dev/tty ]]; then
+        stty sane < /dev/tty 2>/dev/null || true
+        read -r < /dev/tty || true
+    else
+        read -r || true
+    fi
 }
 
 run_cmd() {
@@ -70,15 +77,16 @@ fi
 clear
 banner "Step 1 — Filesystem Isolation"
 
-echo -e "  We'll go through three techniques:"
+echo -e "  We'll go through four techniques:"
 echo -e "  ${BLU}1.${RST} ${BOLD}chroot${RST}      — the 1979 classic"
 echo -e "  ${BLU}2.${RST} ${BOLD}unshare${RST}     — proper mount namespace"
 echo -e "  ${BLU}3.${RST} ${BOLD}pivot_root${RST}  — the container way"
+echo -e "  ${BLU}4.${RST} ${BOLD}loopback rootfs${RST} — separate backing device for /"
 
 pause
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "1/3 — chroot: the classic approach"
+banner "1/4 — chroot: the classic approach"
 
 step "First, look at the HOST root filesystem:"
 run_cmd "ls /"
@@ -107,7 +115,7 @@ warn "Observation: hostname was the same as host — not isolated at all."
 pause
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "2/3 — unshare --mount: own mount namespace"
+banner "2/4 — unshare --mount: own mount namespace"
 
 step "unshare creates a new namespace for us"
 info "With --mount we get a private mount table — mounts here don't leak to host"
@@ -145,7 +153,7 @@ warn "But: /proc/1/cmdline showed the HOST init process — PIDs still leak thro
 pause
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "3/3 — pivot_root: the real container approach"
+banner "3/4 — pivot_root: the real container approach"
 
 step "pivot_root swaps the root mount — not just a chdir trick."
 info "pivot_root requires we are in a new mount namespace AND rootfs is a mount point."
@@ -170,7 +178,7 @@ pause
 info "Running it for you now — type 'exit' when done:"
 echo
 
-unshare --mount bash -c "
+if unshare --mount bash -c "
     set -e
     ROOTFS='${ROOTFS}'
 
@@ -183,30 +191,146 @@ unshare --mount bash -c "
     echo -e '\033[2m  \$\033[0m \033[0;35mcd \$ROOTFS && pivot_root . .oldroot\033[0m'
     cd \"\$ROOTFS\"
     pivot_root . .oldroot
+    cd /
+
+    # clear any stale command hash from old root paths
+    hash -r
 
     echo -e '\033[2m  \$\033[0m \033[0;35mmount -t proc proc /proc\033[0m'
-    mount -t proc proc /proc
+    if command -v mount >/dev/null 2>&1; then
+        mount -t proc proc /proc
+    elif [ -x /bin/busybox ]; then
+        /bin/busybox mount -t proc proc /proc
+    else
+        echo '  ⚠  mount tool not available inside rootfs; skipping /proc mount'
+    fi
 
     echo -e '\033[2m  \$\033[0m \033[0;35mumount -l /.oldroot\033[0m'
-    umount -l /.oldroot
+    if command -v umount >/dev/null 2>&1; then
+        umount -l /.oldroot
+    elif [ -x /bin/busybox ]; then
+        /bin/busybox umount -l /.oldroot
+    else
+        echo '  ⚠  umount tool not available inside rootfs; old root remains mounted'
+    fi
 
     echo
     echo '  ✔  Root is now the Alpine filesystem!'
     echo '  Try: ls /    ls /.oldroot    cat /etc/os-release    cat /proc/mounts'
     echo
     exec /bin/sh
-" || true
-
-echo
-ok "Excellent! The host filesystem was completely hidden."
-ok "That is how real container runtimes (runc, crun) isolate the root."
+"; then
+    echo
+    ok "Excellent! The host filesystem was completely hidden."
+    ok "That is how real container runtimes (runc, crun) isolate the root."
+else
+    echo
+    warn "pivot_root stage failed before full isolation."
+    info "If the error mentions missing mount/umount, rerun ./setup.sh to install demo tools in rootfs."
+fi
 
 pause
+
+# ─────────────────────────────────────────────────────────────────────────────
+banner "4/4 — Advanced: loopback-backed rootfs"
+
+step "Now we run pivot_root on a loop-mounted ext4 image."
+info "This shows '/' backed by a loop device, unlike a simple host directory bind mount."
+
+IMG_PATH="/tmp/containers-step1-loop-${RANDOM}.img"
+HOST_MNT="/tmp/containers-step1-loopmnt-${RANDOM}"
+NS_MNT="/tmp/loopmnt"
+
+echo
+cmd_preview "dd if=/dev/zero of=${IMG_PATH} bs=1M count=512"
+cmd_preview "mkfs.ext4 -F ${IMG_PATH}"
+cmd_preview "mount -o loop ${IMG_PATH} ${HOST_MNT}"
+cmd_preview "cp -a ${ROOTFS}/. ${HOST_MNT}/"
+cmd_preview "umount ${HOST_MNT}"
+pause
+
+set +e
+dd if=/dev/zero of="${IMG_PATH}" bs=1M count=512 status=none
+DD_RC=$?
+set -e
+if [[ $DD_RC -ne 0 ]]; then
+    warn "Could not create loop image file. Skipping advanced loopback stage."
+else
+    mkdir -p "${HOST_MNT}"
+    mkfs.ext4 -F "${IMG_PATH}" >/dev/null
+    mount -o loop "${IMG_PATH}" "${HOST_MNT}"
+    cp -a "${ROOTFS}/." "${HOST_MNT}/"
+    umount "${HOST_MNT}"
+    rmdir "${HOST_MNT}" || true
+
+    info "Running direct loopback pivot_root sequence (no nsenter):"
+    echo
+
+    if unshare --mount --pid --fork bash -c "
+        set -e
+        IMG='${IMG_PATH}'
+        NS_MNT='${NS_MNT}'
+
+        echo -e '\033[2m  \$\033[0m \033[0;35mmount -o loop \$IMG \$NS_MNT\033[0m'
+        mkdir -p \"\$NS_MNT\"
+        mount -o loop \"\$IMG\" \"\$NS_MNT\"
+
+        echo -e '\033[2m  \$\033[0m \033[0;35mmkdir -p \$NS_MNT/.oldroot\033[0m'
+        mkdir -p \"\$NS_MNT/.oldroot\"
+
+        echo -e '\033[2m  \$\033[0m \033[0;35mcd \$NS_MNT && pivot_root . .oldroot\033[0m'
+        cd \"\$NS_MNT\"
+        pivot_root . .oldroot
+        cd /
+        hash -r
+
+        if command -v mount >/dev/null 2>&1; then
+            mount -t proc proc /proc || true
+        elif [ -x /bin/busybox ]; then
+            /bin/busybox mount -t proc proc /proc 2>/dev/null || true
+        fi
+
+        if command -v umount >/dev/null 2>&1; then
+            umount -l /.oldroot || true
+        elif [ -x /bin/busybox ]; then
+            /bin/busybox umount -l /.oldroot 2>/dev/null || true
+        fi
+
+        echo
+        echo '  Backing mount for /:'
+        grep ' / ' /proc/mounts | head -n 1 | sed 's/^/   /'
+        echo '  /etc/os-release first line:'
+        head -n 1 /etc/os-release | sed 's/^/   /'
+        echo
+        echo '  Opening interactive shell now (type exit to return)...'
+
+        if [ -x /bin/bash ]; then
+            exec /bin/bash --noprofile --norc -i
+        elif [ -x /bin/sh ]; then
+            exec /bin/sh -i
+        elif [ -x /bin/busybox ]; then
+            exec /bin/busybox sh -i
+        else
+            echo '  ⚠  No shell binary found inside loopback rootfs.'
+            exit 1
+        fi
+    "; then
+        echo
+        ok "Loopback-backed rootfs demo complete. '/' now shows a loop device source."
+    else
+        echo
+        warn "Loopback stage failed. Check loop mount tools availability and retry."
+    fi
+
+    # Best-effort cleanup on host.
+    rm -f "${IMG_PATH}" || true
+fi
 
 banner "Summary — Step 1 Complete"
 echo -e "  ${GRN}chroot${RST}       simple, old, escap­able"
 echo -e "  ${GRN}unshare --mount${RST}   private mount table, but still uses chdir trick"
 echo -e "  ${GRN}pivot_root${RST}   replaces root mount — the container way"
+echo -e "  ${GRN}loopback rootfs${RST}  same isolation idea, but with a separate backing device"
 echo
 echo -e "  ${YLW}Next:${RST} Step 2 — Resource limits with cgroups"
 echo -e "  ${DIM}  cd ../2-mem && ./demo.sh${RST}"

@@ -11,6 +11,7 @@ BOLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NS_SENTINEL="${SCRIPT_DIR}/.ns_pid"
+UNSHARE_BGPID=""
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -29,7 +30,9 @@ ok()    { echo -e "${GRN}  ✔  $*${RST}"; }
 pause() {
     echo
     echo -e "${YLW}  ══════════ Press ENTER to continue ══════════${RST}"
-    read -r
+    if ! read -r < /dev/tty; then
+        read -r || true
+    fi
 }
 run_cmd() {
     echo -e "${DIM}  \$${RST} ${MAG}$*${RST}"
@@ -44,7 +47,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 cleanup() {
+    if [[ -n "$UNSHARE_BGPID" ]]; then
+        kill "$UNSHARE_BGPID" 2>/dev/null || true
+    fi
     rm -f "$NS_SENTINEL"
+    rm -f "${SCRIPT_DIR}/.demo_pid"
 }
 trap cleanup EXIT
 
@@ -89,24 +96,32 @@ info "  --pid       = new PID namespace"
 info "  --fork      = fork so we become PID 1 in the new ns (not PID 2)"
 info "  --mount-proc = remount /proc for the new namespace"
 echo
-info "Type 'exit' when you're done exploring. Try:"
+info "Running a non-interactive probe (stable for live demos):"
 info "  echo \$\$          # should be 1"
-info "  ps aux           # only this shell and ps!"
-info "  ls /proc | head  # limited list"
-info "  cat /proc/1/comm # bash — we ARE PID 1"
+info "  ps -ef            # only namespace-local processes"
+info "  ls /proc | head   # limited list"
+info "  cat /proc/1/comm  # bash"
 echo
 
 # Store the PID of our unshare process so we can nsenter later
-echo -e "${DIM}  \$${RST} ${MAG}unshare --pid --fork --mount-proc bash${RST}"
+echo -e "${DIM}  \$${RST} ${MAG}unshare --pid --fork --mount-proc bash -c 'echo \$\$; ps -ef; ls /proc | head; cat /proc/1/comm'${RST}"
 
-# We'll launch and record the unshare PID to a file
+# We'll launch and run deterministic commands inside the new PID namespace
 unshare --pid --fork --mount-proc bash -c "
     echo \$\$ > '${NS_SENTINEL}'
     echo
-    echo -e '  \033[1;32m✔  Welcome inside the PID namespace!\033[0m'
-    echo -e '  Host PID is different — inside we are always PID 1 (after fork).'
+    echo -e '  \033[1;32m✔  Inside PID namespace\033[0m'
+    echo -e '  PID in namespace:'
+    echo \$\$
     echo
-    exec bash --norc -i
+    echo -e '  Process list:'
+    ps -ef
+    echo
+    echo -e '  /proc sample:'
+    ls /proc | head
+    echo
+    echo -e '  /proc/1/comm:'
+    cat /proc/1/comm
 " || true
 
 CONTAINER_PID=""
@@ -120,58 +135,63 @@ echo
 step "Verify: from the host, the process had a REAL PID:"
 run_cmd "cat /proc/\$\$/status | grep ^Pid" || true
 
-pause
-
 # ─────────────────────────────────────────────────────────────────────────────
 banner "3/3 — nsenter: joining a running namespace"
 
 info "This is how 'docker exec' works under the hood."
 echo
-step "First, let's start a background process in a new PID namespace"
-info "We'll record its PID so we can re-enter it."
+step "Start a background 'container' (sleeping in a new PID namespace):"
 echo
 
-# Start a sleeping process in a new PID namespace, record its real PID
-PIDFILE="${SCRIPT_DIR}/.demo_pid"
-unshare --pid --fork --mount-proc \
-    bash -c "echo \$\$ > '${PIDFILE}'; exec sleep 3600" &
+# The unshare process itself stays in host PID ns.
+# Its forked CHILD (bash/sleep) is what enters the new PID namespace.
+# We find that child PID via pgrep after launch.
+echo -e "${DIM}  \$${RST} ${MAG}unshare --pid --fork --mount-proc bash -c 'exec sleep 3600' &${RST}"
+unshare --pid --fork --mount-proc bash -c 'exec sleep 3600' &
 UNSHARE_BGPID=$!
-
-# Give it a moment to start
 sleep 0.5
 
-HOST_PID="$UNSHARE_BGPID"
-echo -e "${DIM}  \$${RST} ${MAG}# background 'container' started${RST}"
-echo -e "  Host PID of the unshare process: ${BOLD}${HOST_PID}${RST}"
+# The CHILD (sleep 3600) is the process actually inside the new PID namespace
+CHILD_PID=$(pgrep -P "$UNSHARE_BGPID" 2>/dev/null | head -1)
+if [[ -z "$CHILD_PID" ]]; then
+    warn "Could not find child PID — using unshare PID as fallback"
+    CHILD_PID="$UNSHARE_BGPID"
+fi
+echo -e "  unshare host PID : ${BOLD}${UNSHARE_BGPID}${RST}  (still in host PID namespace)"
+echo -e "  child host PID   : ${BOLD}${CHILD_PID}${RST}  (this one is inside the new PID namespace)"
 echo
 
-step "Verify PID namespace of the 'container' process:"
-run_cmd "ls -la /proc/${HOST_PID}/ns/pid 2>/dev/null || echo '(process may have exited)'"
+step "Compare PID namespaces — host vs container child:"
+echo -e "${DIM}  \$${RST} ${MAG}readlink /proc/self/ns/pid        # this script${RST}"
+SELF_PID_NS="$(readlink /proc/self/ns/pid)"
+echo "  $SELF_PID_NS"
 echo
-run_cmd "ls -la /proc/self/ns/pid"
-info "Different inode → different PID namespace!"
+echo -e "${DIM}  \$${RST} ${MAG}readlink /proc/${UNSHARE_BGPID}/ns/pid   # unshare process${RST}"
+UNSHARE_PID_NS="$(readlink /proc/${UNSHARE_BGPID}/ns/pid 2>/dev/null || echo '(gone)')"
+echo "  $UNSHARE_PID_NS"
+echo
+echo -e "${DIM}  \$${RST} ${MAG}readlink /proc/${CHILD_PID}/ns/pid     # child inside namespace${RST}"
+CHILD_PID_NS="$(readlink /proc/${CHILD_PID}/ns/pid 2>/dev/null || echo '(gone)')"
+echo "  $CHILD_PID_NS"
+echo
+if [[ "$CHILD_PID_NS" != "$SELF_PID_NS" ]]; then
+    ok "child has a DIFFERENT PID namespace than this script — isolation confirmed!"
+else
+    warn "child is in the same PID namespace as this script — pgrep may have found wrong child"
+fi
 
 pause
 
-step "nsenter: join the PID namespace of the container"
-info "We keep our own terminal (mount ns) but share its PID namespace."
+step "nsenter: join the container's PID namespace (like 'docker exec'):"
+echo -e "${DIM}  \$${RST} ${MAG}nsenter --pid --mount --target ${CHILD_PID} -- bash -c 'echo \$\$; ps -ef'${RST}"
+nsenter --pid --mount --target "${CHILD_PID}" -- \
+    bash -c 'echo "our PID inside namespace: $$"; echo; ps -ef' 2>/dev/null || \
+    warn "nsenter into child failed (try targeting unshare PID instead)"
 echo
-info "Inside, try:"
-info "  ps aux           # only sees the container processes"
-info "  ls /proc         # limited"
-info "  echo \$\$          # not 1 (we're a visitor, not PID 1)"
-echo
-
-echo -e "${DIM}  \$${RST} ${MAG}nsenter --pid --target ${HOST_PID} -- bash${RST}"
-nsenter --pid --target "${HOST_PID}" -- \
-    bash --norc -i || true
-
-echo
-ok "nsenter exited."
+ok "nsenter exited — we were a visitor in the container PID namespace."
 
 # Cleanup the background process
 kill "$UNSHARE_BGPID" 2>/dev/null || true
-rm -f "$PIDFILE"
 
 pause
 

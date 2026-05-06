@@ -4,6 +4,19 @@
 # Shows: hostname isolation, then combines ALL namespaces built so far
 # Run as root: sudo ./demo.sh
 # =============================================================================
+#
+# WHY IS IT CALLED "UTS"?
+# UTS stands for UNIX Time-sharing System — a 1970s operating system from Bell
+# Labs that introduced the concept of a system identity (hostname + NIS domain).
+# The kernel struct holding this identity is literally named `struct utsname`
+# (from the uname(2) syscall), and it has always contained:
+#   - nodename   → what we call "hostname"
+#   - domainname → the NIS/YP domain name (not DNS)
+# The UTS namespace isolates that entire struct per process group, so each
+# container can have its own hostname without touching the host's utsname.
+# The name "UTS namespace" is purely historical — it means "namespace that
+# isolates the utsname struct", not anything to do with time-sharing today.
+# =============================================================================
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
 BLU='\033[0;34m'; CYN='\033[0;36m'; MAG='\033[0;35m'
@@ -29,7 +42,9 @@ ok()    { echo -e "${GRN}  ✔  $*${RST}"; }
 pause() {
     echo
     echo -e "${YLW}  ══════════ Press ENTER to continue ══════════${RST}"
-    read -r
+    if ! read -r < /dev/tty; then
+        read -r || true
+    fi
 }
 run_cmd() {
     echo -e "${DIM}  \$${RST} ${MAG}$*${RST}"
@@ -50,6 +65,15 @@ banner "Step 4 — UTS Namespace + Composing Namespaces"
 
 echo -e "  ${BOLD}UTS${RST} = UNIX Time-sharing System"
 echo -e "  The UTS namespace isolates two things: ${BOLD}hostname${RST} and ${BOLD}NIS domain name${RST}."
+echo
+echo -e "  ${DIM}┌─ Historical sidebar nobody asked for but you're getting anyway ──────────┐${RST}"
+echo -e "  ${DIM}│${RST}  In the 1970s Bell Labs built UNIX Time-sharing System (UTS).            ${DIM}│${RST}"
+echo -e "  ${DIM}│${RST}  The kernel kept system identity in a struct called ${BOLD}utsname${RST} — holding   ${DIM}│${RST}"
+echo -e "  ${DIM}│${RST}  nodename (hostname) and domainname (NIS). Fast-forward 50 years:        ${DIM}│${RST}"
+echo -e "  ${DIM}│${RST}  Linux namespaces isolate that struct, and the feature is named after    ${DIM}│${RST}"
+echo -e "  ${DIM}│${RST}  it. So yes — Docker sets your container hostname by exploiting a        ${DIM}│${RST}"
+echo -e "  ${DIM}│${RST}  struct named after a 1970s timesharing OS. Legacy: it never dies.       ${DIM}│${RST}"
+echo -e "  ${DIM}└──────────────────────────────────────────────────────────────────────────┘${RST}"
 echo
 echo -e "  We'll show:"
 echo -e "  ${BLU}1.${RST} Hostname isolation in a UTS namespace"
@@ -76,21 +100,18 @@ info "  hostname my-container       # change it!"
 info "  hostname                    # my-container"
 info "  cat /etc/hostname           # still the host file (shared fs)"
 echo
-echo -e "${DIM}  \$${RST} ${MAG}unshare --uts bash${RST}"
+echo -e "${DIM}  \$${RST} ${MAG}unshare --uts bash -c '...'${RST}"
 
 HOST_HOSTNAME=$(hostname)
 
 unshare --uts bash -c "
     echo
     echo -e '  \033[1;32m✔  Inside UTS namespace!\033[0m'
-    echo -e '  Current hostname: \033[1m'\$(hostname)'\033[0m  (still host value)'
+    echo -e '  Current hostname: \033[1m'\$(hostname)'\033[0m  (still host value, copied in)'
     echo
     hostname my-container
     echo -e '  \033[1;33m▶\033[0m Changed to: \033[1m'\$(hostname)'\033[0m'
-    echo
-    echo '  Now type your own commands. Try: hostname ; hostname -s ; uname -n'
-    echo
-    exec bash --norc -i
+    echo -e '  uname -n: '\$(uname -n)
 " || true
 
 echo
@@ -120,14 +141,16 @@ info "  hostname container-mk1"
 info "  hostname     → container-mk1"
 info "  ps aux       → only shell and ps"
 echo
-echo -e "${DIM}  \$${RST} ${MAG}unshare --mount --pid --uts --fork --mount-proc bash${RST}"
+echo -e "${DIM}  \$${RST} ${MAG}unshare --mount --pid --uts --fork --mount-proc bash -c '...'${RST}"
 
 unshare --mount --pid --uts --fork --mount-proc bash -c "
     echo
     echo -e '  \033[1;32m✔  PID + Mount + UTS namespace!\033[0m'
-    echo -e '  PID: '\$(echo \$\$)'   Hostname: '\$(hostname)
-    echo
-    exec bash --norc -i
+    echo -e \"  PID: \$\$\"
+    hostname container-mk1
+    echo -e \"  Hostname: \$(hostname)\"
+    echo -e '  Processes:'
+    ps -ef
 " || true
 
 ok "Exited combined namespace."
@@ -156,14 +179,12 @@ echo -e "  ${MAG}    hostname hand-rolled-container${RST}"
 echo -e "  ${MAG}    umount -l /.oldroot${RST}"
 echo -e "  ${MAG}    exec /bin/sh${RST}"
 echo
-info "Inside you'll have:"
+info "Inside you'll see:"
 info "  → Alpine root filesystem (pivot_root)"
 info "  → Own PID space (PID 1)"
 info "  → Custom hostname"
 info "  → Clean /proc"
 echo
-info "Try: hostname ; echo \$\$ ; ls / ; cat /etc/os-release ; ps"
-pause
 
 echo -e "${DIM}  \$${RST} ${MAG}unshare --mount --pid --uts --fork bash${RST}"
 
@@ -184,18 +205,20 @@ unshare --mount --pid --uts --fork bash -c "
     cd \"\$ROOTFS\"
     pivot_root . .oldroot
     umount -l /.oldroot
+    hash -r
 
     echo
     echo -e '  \033[1;32m╔═══════════════════════════════════════════╗\033[0m'
-    echo -e '  \033[1;32m║  🎉  Hand-rolled container is running!   ║\033[0m'
+    echo -e '  \033[1;32m║  Hand-rolled container is running!       ║\033[0m'
     echo -e '  \033[1;32m╚═══════════════════════════════════════════╝\033[0m'
     echo
-    echo -e '  hostname: '\$(hostname)
-    echo -e '  PID:      '\$\$
+    echo -e '  hostname:        '\$(cat /proc/sys/kernel/hostname)
+    echo -e '  PID (we are 1):  '\$\$
     echo -e '  /etc/os-release:'
-    grep PRETTY /etc/os-release 2>/dev/null || cat /etc/os-release | head -2
+    grep PRETTY /etc/os-release 2>/dev/null || head -2 /etc/os-release
     echo
-    exec /bin/sh -i
+    echo -e '  ps:'
+    ps 2>/dev/null || ls /proc | grep '^[0-9]'
 " || true
 
 echo

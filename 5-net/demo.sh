@@ -35,7 +35,9 @@ ok()    { echo -e "${GRN}  ✔  $*${RST}"; }
 pause() {
     echo
     echo -e "${YLW}  ══════════ Press ENTER to continue ══════════${RST}"
-    read -r
+    if ! read -r < /dev/tty; then
+        read -r || true
+    fi
 }
 run_cmd() {
     echo -e "${DIM}  \$${RST} ${MAG}$*${RST}"
@@ -214,21 +216,24 @@ run_cmd "ip netns exec ${NS_NAME} ping -c 3 8.8.8.8" || \
 pause
 
 # ─────────────────────────────────────────────────────────────────────────────
-banner "5b/6 — Interactive shell inside the network namespace"
+banner "5b/6 — Probe inside the network namespace"
 
-step "Enter the network namespace interactively:"
-info "Try:"
-info "  ip addr show    → only lo and ${VETH_CTR}"
-info "  ip route show   → default via ${HOST_IP}"
-info "  ping ${HOST_IP}  → pings the host"
-info "  ping 8.8.8.8     → internet via NAT"
+step "Run a stable non-interactive probe inside the net namespace:"
+info "Shows addresses, routes, and connectivity checks."
 echo
-echo -e "${DIM}  \$${RST} ${MAG}ip netns exec ${NS_NAME} bash${RST}"
+echo -e "${DIM}  \$${RST} ${MAG}ip netns exec ${NS_NAME} bash -c 'ip addr; ip route; ping ...'${RST}"
 
-ip netns exec "${NS_NAME}" bash --norc -i || true
+ip netns exec "${NS_NAME}" bash -c "
+    ip addr show
+    echo
+    ip route show
+    echo
+    ping -c 2 ${HOST_IP}
+    ping -c 2 8.8.8.8
+" || true
 
 echo
-ok "Exited the network namespace."
+ok "Net namespace probe completed."
 
 pause
 
@@ -260,13 +265,7 @@ info "  • PID 1 (new PID namespace)"
 info "  • hostname 'full-container'"
 info "  • Own network via ${VETH_CTR} — ${CTR_IP}"
 echo
-info "Inside, try:"
-info "  hostname              → full-container"
-info "  echo \$\$               → 1"
-info "  cat /etc/os-release   → Alpine"
-info "  ip addr show          → ${CTR_IP} on ${VETH_CTR}"
-info "  ping ${HOST_IP}        → pings the host"
-info "  ping 8.8.8.8           → internet via NAT"
+info "The script will print hostname, PID, distro, process list, and network config."
 echo
 
 echo -e "${DIM}  \$${RST} ${MAG}ip netns exec ${NS_NAME} unshare --mount --pid --uts --fork bash${RST}"
@@ -293,17 +292,24 @@ ip netns exec "${NS_NAME}" \
     cd \"\$ROOTFS\"
     pivot_root . .oldroot
     umount -l /.oldroot
+    hash -r
 
     echo
     echo -e '  \033[1;32m╔═══════════════════════════════════════════════╗\033[0m'
-    echo -e '  \033[1;32m║  🎉  Full hand-rolled container running!     ║\033[0m'
+    echo -e '  \033[1;32m║  Full hand-rolled container running!         ║\033[0m'
     echo -e '  \033[1;32m╚═══════════════════════════════════════════════╝\033[0m'
     echo
-    echo '  hostname: '\$(hostname)
+    echo '  hostname: '\$(cat /proc/sys/kernel/hostname)
     echo '  PID:      '\$\$
+    echo '  /etc/os-release:'
+    grep PRETTY /etc/os-release 2>/dev/null || head -2 /etc/os-release
+    echo
+    echo '  ps:'
+    ps 2>/dev/null || ls /proc | grep '^[0-9]'
+    echo
+    echo '  ip addr:'
     ip addr show 2>/dev/null | grep -E 'inet |^[0-9]' || true
     echo
-    exec /bin/sh -i
 " || true
 
 fi # end rootfs check
