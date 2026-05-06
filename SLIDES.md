@@ -969,14 +969,18 @@ Demo points:
 ```mermaid
 %%{init: {"theme":"base", "themeVariables": {"primaryColor":"#161b22", "primaryTextColor":"#e6edf3", "primaryBorderColor":"#79c0ff", "lineColor":"#e6edf3", "secondaryColor":"#0d1117", "tertiaryColor":"#161b22", "edgeLabelBackground":"#0d1117", "fontSize":"24px"}}}%%
 flowchart LR
-  subgraph Pod[Pod: demo-sharepod]
-    INFRA[infra container]
-    WEB[nginx container]
-    SIDE[sidecar/container]
+  H[Host browser\n127.0.0.1:8091 or :8092] --> INFRA
+
+  subgraph POD[Pod: shared network namespace]
+    INFRA[infra container\nowns pod netns]
+    subgraph NET[Same net namespace / loopback]
+      WEB[web container\nnginx listens on :80]
+      CLI[client container\nbusybox wget/curl]
+    end
+    CLI -- "http://127.0.0.1:80" --> WEB
   end
-  H[Host :8091/:8092] --> INFRA
-  INFRA --> WEB
-  INFRA --> SIDE
+
+  INFRA -. "port publish" .-> WEB
 ```
 
 ```bash
@@ -986,6 +990,7 @@ cd 7-podman/3-pods
 
 Demo points:
 - Multiple containers share one pod network namespace
+- `localhost` is shared inside the pod (`client -> 127.0.0.1:80 -> web`)
 - Pod lifecycle commands (`pod create`, `pod ps`)
 - Kubernetes bridge (`generate kube`, `play kube`)
 

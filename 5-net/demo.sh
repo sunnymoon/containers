@@ -57,6 +57,9 @@ cleanup() {
     fi
     # remove iptables NAT rule
     iptables -t nat -D POSTROUTING -s "${SUBNET}" ! -o "${VETH_HOST}" -j MASQUERADE 2>/dev/null || true
+    # remove forwarding rules added for this demo (important when FORWARD policy is DROP)
+    iptables -D FORWARD -i "${VETH_HOST}" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "${VETH_HOST}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     ok "Network cleanup complete."
 }
 trap cleanup EXIT
@@ -201,6 +204,13 @@ step "Add a NAT/masquerade rule for outbound container traffic:"
 info "This is exactly what 'docker run -p' sets up automatically."
 run_cmd "iptables -t nat -A POSTROUTING -s ${SUBNET} ! -o ${VETH_HOST} -j MASQUERADE"
 run_cmd "iptables -t nat -L POSTROUTING -n -v | grep -v '^$'"
+echo
+
+step "Allow forwarding for this veth pair (needed if FORWARD policy is DROP):"
+info "Docker often sets FORWARD policy to DROP, so we add explicit allow rules."
+run_cmd "iptables -A FORWARD -i ${VETH_HOST} -j ACCEPT"
+run_cmd "iptables -A FORWARD -o ${VETH_HOST} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+run_cmd "iptables -S FORWARD | grep ${VETH_HOST}"
 echo
 
 step "Add a default route inside the container:"
