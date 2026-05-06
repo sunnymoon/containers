@@ -6,7 +6,13 @@ RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; BLU='\033[0;34m'; MAG='\03
 step() { echo -e "${YLW}▶ $*${RST}"; }
 info() { echo -e "${BLU}  i  $*${RST}"; }
 ok() { echo -e "${GRN}  ok  $*${RST}"; }
-pause() { echo -e "${YLW}Press ENTER to continue${RST}"; read -r; }
+warn() { echo -e "${RED}  !  $*${RST}"; }
+pause() {
+  echo -e "${YLW}Press ENTER to continue${RST}"
+  if ! read -r < /dev/tty; then
+    read -r || true
+  fi
+}
 run_cmd() { echo -e "${DIM}$ ${MAG}$*${RST}"; eval "$@"; }
 
 if ! command -v podman >/dev/null 2>&1; then
@@ -27,7 +33,16 @@ info "Goal: run container daemonlessly, inspect, exec"
 pause
 
 step "Run nginx mapped to host port"
-run_cmd "podman run -d --name step7-nginx -p 8090:80 -v $SCRIPT_DIR/nginx.conf:/etc/nginx/nginx.conf:ro docker.io/library/nginx:alpine"
+run_cmd "podman run -d --name step7-nginx -p 8090:80 -v $SCRIPT_DIR/nginx.conf:/etc/nginx/nginx.conf:ro,Z docker.io/library/nginx:alpine"
+
+if ! podman ps --filter name=step7-nginx --filter status=running --format '{{.ID}}' | grep -q .; then
+  warn "step7-nginx did not stay running"
+  run_cmd "podman ps -a --filter name=step7-nginx"
+  run_cmd "podman logs --tail 80 step7-nginx"
+  exit 1
+fi
+
+ok "Container is running"
 pause
 
 step "Inspect running containers"
